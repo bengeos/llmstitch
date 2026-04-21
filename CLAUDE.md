@@ -51,9 +51,10 @@ Every request flows through the same pipeline: `Agent.run` → `ProviderAdapter.
 ## Release process
 
 - **CI** (`.github/workflows/ci.yml`) runs ruff + ruff-format + mypy + pytest on Python 3.10–3.13 for every push to `main` and every PR. It installs `".[dev,anthropic,openai,gemini]"` so adapter tests can import vendor SDKs if needed.
-- **Release** (`.github/workflows/release.yml`) fires on tags matching `v*` and publishes via **PyPI Trusted Publishing** (OIDC, environment `pypi`) — there are no API tokens in the repo or GitHub secrets, and there should never be.
-- Normal flow: bump `version` in `pyproject.toml` → update `CHANGELOG.md` → commit → `git tag v0.x.y` → `git push --tags`.
-- The very first PyPI release must be published manually with `twine upload` to claim the name; Trusted Publishing is configured on the PyPI project page afterward. Subsequent releases go via the tag workflow.
+- **Release** (`.github/workflows/release.yml`) fires when a PR is merged into `main` and publishes via **PyPI Trusted Publishing** (OIDC, environment `pypi`) — there are no API tokens in the repo or GitHub secrets, and there should never be. The workflow reads `project.version` from `pyproject.toml` and publishes *only* if the matching `v<version>` git tag does not already exist; if it does, the publish job is skipped. After a successful PyPI upload, the workflow tags the merge commit and creates a GitHub Release (notes extracted from the `## [<version>]` section of `CHANGELOG.md`, with the built wheel + sdist attached as release assets).
+- Normal flow: open a PR that bumps `version` in `pyproject.toml` and updates `CHANGELOG.md` (add a `## [<new-version>]` section — the release-notes extractor keys off that exact format) → merge to `main` → the workflow builds + publishes + tags + creates the GitHub Release. No manual `git tag`/`git push --tags`/`gh release create` step.
+- Because the workflow needs to push a tag, create a release, and fetch an OIDC token, the `publish` job has `permissions: { id-token: write, contents: write }`. Don't drop either. The `gh release` step uses the default `GITHUB_TOKEN`; no personal access token is involved.
+- The very first release uses Trusted Publishing's **pending publisher** feature — configure owner `bengeos`, repo `llmstitch`, workflow `release.yml`, environment `pypi` at `https://pypi.org/manage/account/publishing/` *before* the first merge, so PyPI accepts the OIDC request for a project that doesn't exist yet. No `twine upload` step is needed.
 
 ## Roadmap notes
 
