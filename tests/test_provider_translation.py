@@ -10,10 +10,13 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from llmstitch.providers.anthropic import AnthropicAdapter
 from llmstitch.providers.gemini import GeminiAdapter
 from llmstitch.providers.groq import GroqAdapter
 from llmstitch.providers.openai import OpenAIAdapter
+from llmstitch.providers.openrouter import OpenRouterAdapter
 from llmstitch.types import (
     Message,
     TextBlock,
@@ -242,6 +245,51 @@ def test_groq_translate_messages_with_tools() -> None:
         ),
     ]
     out = GroqAdapter.translate_messages(msgs, system="be helpful")
+    assert out[0] == {"role": "system", "content": "be helpful"}
+    assert out[1] == {"role": "user", "content": "hi"}
+    assert out[2]["tool_calls"][0]["id"] == "call_1"
+    assert json.loads(out[2]["tool_calls"][0]["function"]["arguments"]) == {"x": 1}
+    assert out[3] == {"role": "tool", "tool_call_id": "call_1", "content": "42"}
+
+
+# ---------- OpenRouter ---------- #
+
+
+def test_openrouter_reuses_openai_translation() -> None:
+    # OpenRouter exposes the OpenAI Chat Completions wire format verbatim, so
+    # the adapter inherits translation directly from OpenAIAdapter.
+    assert OpenRouterAdapter.translate_messages is OpenAIAdapter.translate_messages
+    assert OpenRouterAdapter.translate_tools is OpenAIAdapter.translate_tools
+    assert OpenRouterAdapter.parse_response is OpenAIAdapter.parse_response
+
+
+def test_openrouter_init_sets_base_url_and_ranking_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    adapter = OpenRouterAdapter(http_referer="https://example.com", x_title="example-app")
+    assert str(adapter._client.base_url).startswith("https://openrouter.ai/api/v1")
+    # `api_key` is stored on the underlying client; exact attr name is stable in openai>=1.
+    assert getattr(adapter._client, "api_key", None) == "test-key"
+    # default_headers is merged with the SDK's internal defaults; verify ours landed.
+    default_headers = getattr(adapter._client, "default_headers", {}) or {}
+    assert default_headers.get("HTTP-Referer") == "https://example.com"
+    assert default_headers.get("X-Title") == "example-app"
+
+
+def test_openrouter_translate_messages_with_tools() -> None:
+    msgs = [
+        Message(role="user", content="hi"),
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call_1", name="f", input={"x": 1})],
+        ),
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="call_1", content="42")],
+        ),
+    ]
+    out = OpenRouterAdapter.translate_messages(msgs, system="be helpful")
     assert out[0] == {"role": "system", "content": "be helpful"}
     assert out[1] == {"role": "user", "content": "hi"}
     assert out[2]["tool_calls"][0]["id"] == "call_1"

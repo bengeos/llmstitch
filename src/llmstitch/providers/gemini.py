@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from ..types import (
     CompletionResponse,
     ContentBlock,
     Message,
+    MessageStop,
+    StreamDone,
+    StreamEvent,
     TextBlock,
+    TextDelta,
     ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
+    ToolUseDelta,
+    ToolUseStart,
+    ToolUseStop,
 )
 from .base import ProviderAdapter
 
@@ -136,4 +145,81 @@ class GeminiAdapter(ProviderAdapter):
             stop_reason=stop_reason,
             usage=usage,
             raw=response,
+        )
+
+    async def stream(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        system: str | None = None,
+        tools: list[ToolDefinition] | None = None,
+        max_tokens: int = 4096,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamEvent]:
+        from google.genai import types as genai_types
+
+        contents = self.translate_messages(messages)
+        config_kwargs: dict[str, Any] = {"max_output_tokens": max_tokens}
+        if system:
+            config_kwargs["system_instruction"] = system
+        if tools:
+            config_kwargs["tools"] = self.translate_tools(tools)
+        config = genai_types.GenerateContentConfig(**config_kwargs)
+
+        text_buf: list[str] = []
+        tool_uses: list[tuple[str, str, dict[str, Any]]] = []
+        stop_reason = "stop"
+        usage: dict[str, int] | None = None
+
+        iterator = await self._client.aio.models.generate_content_stream(
+            model=model, contents=contents, config=config, **kwargs
+        )
+        async for chunk in iterator:
+            candidates = getattr(chunk, "candidates", None) or []
+            if candidates:
+                candidate = candidates[0]
+                parts = getattr(getattr(candidate, "content", None), "parts", None) or []
+                for part in parts:
+                    text_piece = getattr(part, "text", None)
+                    fn_call = getattr(part, "function_call", None)
+                    if text_piece:
+                        text_buf.append(text_piece)
+                        yield TextDelta(text=text_piece)
+                    elif fn_call is not None:
+                        name = getattr(fn_call, "name", "")
+                        args_raw = getattr(fn_call, "args", {}) or {}
+                        args = dict(args_raw) if not isinstance(args_raw, dict) else args_raw
+                        tu_id = f"{name}_{len(tool_uses)}"
+                        tool_uses.append((tu_id, name, args))
+                        # Gemini delivers function calls as whole parts, not as
+                        # progressive JSON — emit start/delta/stop back-to-back.
+                        yield ToolUseStart(id=tu_id, name=name)
+                        yield ToolUseDelta(id=tu_id, partial_json=json.dumps(args))
+                        yield ToolUseStop(id=tu_id)
+                finish = getattr(candidate, "finish_reason", None)
+                if finish is not None:
+                    stop_reason = finish.name.lower() if hasattr(finish, "name") else str(finish)
+            raw_usage = getattr(chunk, "usage_metadata", None)
+            if raw_usage is not None:
+                usage = {
+                    "input_tokens": getattr(raw_usage, "prompt_token_count", 0),
+                    "output_tokens": getattr(raw_usage, "candidates_token_count", 0),
+                }
+
+        yield MessageStop(stop_reason=stop_reason, usage=usage)
+
+        content: list[ContentBlock] = []
+        text = "".join(text_buf)
+        if text:
+            content.append(TextBlock(text=text))
+        for tu_id, name, args in tool_uses:
+            content.append(ToolUseBlock(id=tu_id, name=name, input=args))
+        yield StreamDone(
+            response=CompletionResponse(
+                content=content,
+                stop_reason=stop_reason,
+                usage=usage,
+                raw=None,
+            )
         )

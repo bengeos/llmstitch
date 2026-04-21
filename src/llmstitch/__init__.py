@@ -10,11 +10,18 @@ from .types import (
     CompletionResponse,
     ContentBlock,
     Message,
+    MessageStop,
     Role,
+    StreamDone,
+    StreamEvent,
     TextBlock,
+    TextDelta,
     ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
+    ToolUseDelta,
+    ToolUseStart,
+    ToolUseStop,
 )
 
 try:
@@ -37,5 +44,12 @@ __all__ = [
     "ContentBlock",
     "ToolDefinition",
     "CompletionResponse",
+    "TextDelta",
+    "ToolUseStart",
+    "ToolUseDelta",
+    "ToolUseStop",
+    "MessageStop",
+    "StreamDone",
+    "StreamEvent",
     "__version__",
 ]

@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from ..types import (
     CompletionResponse,
     ContentBlock,
     Message,
+    MessageStop,
+    StreamDone,
+    StreamEvent,
     TextBlock,
+    TextDelta,
     ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
+    ToolUseDelta,
+    ToolUseStart,
+    ToolUseStop,
 )
 from .base import ProviderAdapter
 
@@ -144,4 +152,95 @@ class OpenAIAdapter(ProviderAdapter):
             stop_reason=choice.finish_reason or "stop",
             usage=usage,
             raw=response,
+        )
+
+    async def stream(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        system: str | None = None,
+        tools: list[ToolDefinition] | None = None,
+        max_tokens: int = 4096,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamEvent]:
+        translated = self.translate_messages(messages, system=system)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": translated,
+            "max_tokens": max_tokens,
+            "stream": True,
+            # Opt in to usage-in-final-chunk — harmless on providers that ignore it.
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            payload["tools"] = self.translate_tools(tools)
+        payload.update(kwargs)
+
+        text_buf: list[str] = []
+        # Tool calls stream interleaved by index; the first delta for a new index
+        # carries the id + function.name, later deltas carry argument fragments only.
+        tool_calls: dict[int, dict[str, Any]] = {}
+        tool_call_order: list[int] = []
+        stop_reason = "stop"
+        usage: dict[str, int] | None = None
+
+        stream = await self._client.chat.completions.create(**payload)
+        async for chunk in stream:
+            raw_usage = getattr(chunk, "usage", None)
+            if raw_usage is not None:
+                usage = {
+                    "input_tokens": getattr(raw_usage, "prompt_tokens", 0),
+                    "output_tokens": getattr(raw_usage, "completion_tokens", 0),
+                }
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice = choices[0]
+            finish = getattr(choice, "finish_reason", None)
+            if finish:
+                stop_reason = finish
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            text_piece = getattr(delta, "content", None)
+            if text_piece:
+                text_buf.append(text_piece)
+                yield TextDelta(text=text_piece)
+            for tc_delta in getattr(delta, "tool_calls", None) or []:
+                idx = getattr(tc_delta, "index", 0)
+                fn = getattr(tc_delta, "function", None)
+                if idx not in tool_calls:
+                    tc_id = getattr(tc_delta, "id", "") or ""
+                    tc_name = getattr(fn, "name", "") or "" if fn is not None else ""
+                    tool_calls[idx] = {"id": tc_id, "name": tc_name, "arguments": ""}
+                    tool_call_order.append(idx)
+                    yield ToolUseStart(id=tc_id, name=tc_name)
+                args_piece = getattr(fn, "arguments", None) if fn is not None else None
+                if args_piece:
+                    tool_calls[idx]["arguments"] += args_piece
+                    yield ToolUseDelta(id=tool_calls[idx]["id"], partial_json=args_piece)
+
+        for idx in tool_call_order:
+            yield ToolUseStop(id=tool_calls[idx]["id"])
+        yield MessageStop(stop_reason=stop_reason, usage=usage)
+
+        content: list[ContentBlock] = []
+        text = "".join(text_buf)
+        if text:
+            content.append(TextBlock(text=text))
+        for idx in tool_call_order:
+            tc = tool_calls[idx]
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {"_raw": tc["arguments"]}
+            content.append(ToolUseBlock(id=tc["id"], name=tc["name"], input=args))
+        yield StreamDone(
+            response=CompletionResponse(
+                content=content,
+                stop_reason=stop_reason,
+                usage=usage,
+                raw=None,
+            )
         )
