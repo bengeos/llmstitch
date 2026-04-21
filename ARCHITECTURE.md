@@ -127,14 +127,17 @@ class Weather(Skill):
 
 ### 3.4 `providers/base.py` — the adapter contract
 
-`ProviderAdapter` is an ABC with two methods:
+`ProviderAdapter` is an ABC with four methods:
 
 ```python
 async def complete(*, model, messages, system, tools, max_tokens, **kwargs) -> CompletionResponse
 async def stream(*, model, messages, system, tools, max_tokens, **kwargs) -> AsyncIterator[StreamEvent]
+async def count_tokens(*, model, messages, system, tools) -> TokenCount
+@classmethod
+def default_retryable(cls) -> tuple[type[BaseException], ...]
 ```
 
-`complete()` is abstract; `stream()` has a default implementation that raises `NotImplementedError` so adapters can opt in. All five in-tree adapters implement both. The `yield` after the raise in the base stub exists only to satisfy the `AsyncIterator` return type for mypy; it's `# pragma: no cover`.
+`complete()` is abstract; `stream()`, `count_tokens()`, and `default_retryable()` all ship with default implementations. `stream()` raises `NotImplementedError` (all five in-tree adapters implement it); `count_tokens()` also raises by default — Anthropic and Gemini override with native implementations, the OpenAI-family adapters do not because llmstitch does not estimate with third-party tokenizers. `default_retryable()` returns an empty tuple by default; each adapter overrides to return its vendor's transient exception classes via a lazy SDK import. The `yield` after the `stream()` raise in the base stub exists only to satisfy the `AsyncIterator` return type for mypy; it's `# pragma: no cover`.
 
 ### 3.5 `providers/*.py` — per-vendor adapters
 
@@ -159,7 +162,15 @@ Current roster and notable quirks:
 
 The Groq and OpenRouter adapters illustrate the extension story: if a provider speaks OpenAI's wire format, subclass `OpenAIAdapter` and override only what's different (typically just the client constructor). Don't reimplement translation.
 
-### 3.6 `__init__.py` — the curated public surface
+### 3.6 `retry.py` — backoff for provider calls
+
+`RetryPolicy` is a frozen dataclass (`max_attempts`, `initial_delay`, `max_delay`, `multiplier`, `jitter`, `retry_on`, `respect_retry_after`, `on_retry`). `retry_call(policy, factory)` invokes a zero-arg coroutine factory, catches any exception in `policy.retry_on`, and sleeps `initial * multiplier**(attempt-1)` seconds (capped at `max_delay`, jittered within `±policy.jitter`). If `respect_retry_after=True` and the exception carries a `Retry-After` header or `retry_after` attribute, that value becomes the delay *floor*. When `policy is None` the helper short-circuits to a single awaited call — zero overhead in the no-retry path.
+
+`Agent.run` wraps `provider.complete(...)` in `retry_call(self.retry_policy, ...)`. The factory closes over `messages`; since history is only mutated *after* a successful response, every retry within a turn observes the same pre-turn state — no need to snapshot.
+
+**Streaming is deliberately not retried.** Once a `TextDelta` has been yielded from `Agent.run_stream`, the caller may already have rendered it — there's no safe rollback. Retrying only the *initial* stream-open would require refactoring every adapter's `stream()` to split "open the SDK stream" from "consume events," which we defer. `run_stream` therefore propagates provider exceptions unchanged.
+
+### 3.7 `__init__.py` — the curated public surface
 
 Everything users should need is re-exported here (`Agent`, `tool`, `Tool`, `Skill`, `ToolRegistry`, the `types.py` dataclasses, `MaxIterationsExceeded`, `__version__`). **Adapters are deliberately *not* re-exported at the top level** — users import `llmstitch.providers.anthropic` explicitly. This keeps the lazy-import guarantee intact: `import llmstitch` never triggers any vendor SDK.
 
@@ -349,9 +360,12 @@ The cost is linear in the number of adapters — consider whether the feature ca
 
 Tracked on the roadmap, not yet implemented:
 
-- **Retries / backoff** — the agent loop does not retry transient provider errors today.
-- **Token-counting helpers** — no adapter-level `count_tokens` method.
 - **Structured-output helpers** — no JSON-mode / schema-constrained-decoding wrapper.
 - **MCP integration** — on the roadmap per the README.
+- **Streaming retries** — `run_stream` does not retry today; see §3.6 for why. A future version may retry the initial stream-open, once adapters are refactored to separate that from event consumption.
 
-Adding any of these is a v0.2.x (minor-bump) concern and likely requires extending `ProviderAdapter` — do that behind default implementations that degrade gracefully, so existing adapters don't all need to change at once.
+Landed earlier:
+- **Retries / backoff** (v0.1.3) — see §3.6.
+- **Token counting** (v0.1.3) — `count_tokens()` on Anthropic and Gemini adapters; see §3.4.
+
+Adding any of the remaining items is a v0.2.x (minor-bump) concern and likely requires extending `ProviderAdapter` — do that behind default implementations that degrade gracefully, so existing adapters don't all need to change at once.

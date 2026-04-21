@@ -244,3 +244,14 @@ class OpenAIAdapter(ProviderAdapter):
                 raw=None,
             )
         )
+
+    @classmethod
+    def default_retryable(cls) -> tuple[type[BaseException], ...]:
+        import openai  # lazy
+
+        return (
+            openai.RateLimitError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+        )

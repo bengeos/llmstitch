@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-04-22
+
+### Added
+- **Retries / backoff.** New `RetryPolicy` + `RetryAttempt` dataclasses and a `retry_call` helper in `llmstitch.retry`. `Agent` gains a `retry_policy: RetryPolicy | None = None` field; when set, `Agent.run` wraps each `provider.complete(...)` call with exponential backoff (with jitter) and honors `Retry-After` headers. Each adapter exposes `default_retryable()` returning its vendor's transient error classes (rate-limit / timeout / connection / 5xx) so users can wire up a sensible policy in one line: `RetryPolicy(retry_on=AnthropicAdapter.default_retryable(), max_attempts=3)`. Non-retryable exceptions pass through unchanged.
+- **Token counting.** New `TokenCount` dataclass and `ProviderAdapter.count_tokens(...)` method (async). `AnthropicAdapter` implements it via `client.messages.count_tokens`; `GeminiAdapter` via `client.aio.models.count_tokens`. `Agent.count_tokens(prompt)` forwards with the agent's system prompt + registered tools. `OpenAIAdapter`, `GroqAdapter`, and `OpenRouterAdapter` inherit the base implementation that raises `NotImplementedError` — we don't estimate with third-party tokenizers that may disagree with the provider's own count.
+- **Agent usage tracking.** New `UsageTally` dataclass and an `Agent.usage` field that accumulates across the agent's lifetime. Tracks tokens (`input_tokens`, `output_tokens`, `turns`, `total_tokens`), call activity (`api_calls`, `retries`), and exposes `record_call()` / `record_retry()` / `add()` / `reset()`. Fed by `Agent.run` (bumps `api_calls` per `provider.complete(...)` invocation and `retries` via an auto-wrapped `on_retry` that preserves the user's callback) and `Agent.run_stream` (bumps `api_calls` per stream; streams are not retried). On a successful run with usage-reporting providers, `api_calls == turns + retries`. Not safe for concurrent use on the same agent — same constraint as the run loop itself.
+- **Pricing / cost helpers.** New `Pricing` dataclass (`input_per_mtok`, `output_per_mtok` — USD per 1M tokens, matching vendor rate cards) and `Cost` dataclass (`input_cost`, `output_cost`, `total` property). `UsageTally.cost(pricing)` returns a `Cost` breakdown; `Agent` gains a `pricing: Pricing` field (default `Pricing(1.00, 2.00)` — a placeholder, not any real model's rates) and an `Agent.cost()` method that prices the current usage against it. Pass `pricing=Pricing(...)` to the `Agent` constructor for real vendor rates. No built-in per-model rate table — prices change and we don't want a stale source of truth in the library.
+- New public exports: `RetryPolicy`, `RetryAttempt`, `TokenCount`, `UsageTally`, `Pricing`, `Cost`.
+
+### Notes
+- Retries apply to `Agent.run` / `provider.complete(...)` only. Streaming is not retried in v0.1.3: deltas may already have been yielded to the caller before an error surfaces, with no safe way to roll them back. `Agent.run_stream` remains unchanged.
+- Gemini's `count_tokens` endpoint takes `contents` only — it does not accept tool declarations or a system instruction, so tokens those contribute are not reflected in the returned count. This is a vendor limitation.
+
 ## [0.1.2] - 2026-04-21
 
 ### Added

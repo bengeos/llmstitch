@@ -26,12 +26,12 @@ async def main() -> None:
 
     agent = Agent(
         provider=AnthropicAdapter(),
-        model="claude-opus-4-7",
+        model="claude-haiku-4-5-20251001",
         system="You are a helpful weather assistant. Use the tool when asked about a city.",
     )
     agent.tools.register(get_weather)
 
-    history = await agent.run("What's the weather in Tokyo?")
+    history = await agent.run("What's the weather in Addis Ababa?")
     final = history[-1]
     if isinstance(final.content, list):
         from llmstitch.types import TextBlock

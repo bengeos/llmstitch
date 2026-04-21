@@ -14,6 +14,7 @@ from ..types import (
     StreamEvent,
     TextBlock,
     TextDelta,
+    TokenCount,
     ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
@@ -199,4 +200,32 @@ class AnthropicAdapter(ProviderAdapter):
                 usage=usage,
                 raw=final_message,
             )
+        )
+
+    async def count_tokens(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        system: str | None = None,
+        tools: list[ToolDefinition] | None = None,
+    ) -> TokenCount:
+        translated = self.translate_messages(messages)
+        payload: dict[str, Any] = {"model": model, "messages": translated}
+        if system:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = self.translate_tools(tools)
+        response = await self._client.messages.count_tokens(**payload)
+        return TokenCount(input_tokens=int(getattr(response, "input_tokens", 0)))
+
+    @classmethod
+    def default_retryable(cls) -> tuple[type[BaseException], ...]:
+        import anthropic  # lazy — core install must not require the SDK
+
+        return (
+            anthropic.RateLimitError,
+            anthropic.APITimeoutError,
+            anthropic.APIConnectionError,
+            anthropic.InternalServerError,
         )
