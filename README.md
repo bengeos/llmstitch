@@ -49,6 +49,10 @@ print(messages[-1].content)
 - **Retries** — opt in with a `RetryPolicy`; exponential backoff with jitter, honors `Retry-After` headers, uses each adapter's own transient-error classes.
 - **Token counting** — `Agent.count_tokens(prompt)` via native provider endpoints (Anthropic, Gemini).
 - **Usage and cost** — `agent.usage` (a `UsageTally`) accumulates tokens, turns, API calls, and retries across a run; `agent.cost()` prices it against a `Pricing` rate card in USD.
+- **Observability** — attach an `EventBus` and subscribe (sync callback or async iterator) to per-turn model / tool / usage / stop events. Zero overhead when unused.
+- **Cost ceiling** — set `cost_ceiling=` (USD) and the run halts mid-loop if accumulated spend crosses it. Retries don't double-charge.
+- **Non-raising `run_with_result()`** — structured `AgentResult` with `stop_reason ∈ {"complete", "max_iterations", "cost_ceiling", "error"}` so service code never has to catch.
+- **Concurrency-aware tools** — `@tool(is_read_only=True, is_concurrency_safe=False)` annotates tools; mixed-safety batches run sequentially, all-safe batches parallelize with `asyncio.gather`.
 - **Skills** — bundle a system prompt with a set of tools; compose with `.extend()`.
 - **PEP 561 typed** — ships with `py.typed`, fully checked under `mypy --strict`.
 
@@ -117,6 +121,62 @@ print(agent.cost().total)  # USD
 
 `agent.usage` accumulates across every `run` / `run_stream` on that agent — tokens (fed by adapters that report usage), `turns` (model responses folded in), `api_calls` (provider invocations), and `retries` (from the retry policy). Call `agent.usage.reset()` to zero the counters between logical sessions, or `usage.cost(other_pricing)` directly to price the same tally against a different rate card. The default `Pricing(1.00, 2.00)` is a placeholder — pass real vendor rates for accurate costs.
 
+## Observability
+
+```python
+from llmstitch import (
+    Agent, EventBus, Event,
+    AgentStopped, ToolExecutionCompleted, UsageUpdated,
+)
+from llmstitch.providers.anthropic import AnthropicAdapter
+
+
+def on_event(event: Event) -> None:
+    if isinstance(event, ToolExecutionCompleted):
+        print(f"{event.call.name} -> {event.result.content!r} in {event.duration_s*1000:.0f}ms")
+    elif isinstance(event, UsageUpdated) and event.delta is not None:
+        print(f"+{event.delta.get('input_tokens', 0)}in / "
+              f"+{event.delta.get('output_tokens', 0)}out "
+              f"(total {event.usage.total_tokens})")
+    elif isinstance(event, AgentStopped):
+        print(f"stop: {event.stop_reason} after {event.turns} turns")
+
+
+bus = EventBus()
+bus.subscribe(on_event)                          # also supports `async for event in bus.stream()`
+
+agent = Agent(provider=AnthropicAdapter(), model="claude-opus-4-7", event_bus=bus)
+```
+
+`EventBus` emits frozen dataclasses for every phase of the run — `AgentStarted`, `TurnStarted`, `ModelRequestSent`, `ModelResponseReceived`, `ToolExecutionStarted`/`Completed`, `UsageUpdated`, `AgentStopped`. Subscriber exceptions are swallowed with a `RuntimeWarning` so observers cannot break the agent loop. Events flow through the bus only — they are **not** interleaved into `run_stream`'s `StreamEvent` iterator.
+
+## Cost ceiling and non-raising runs
+
+```python
+from llmstitch import Agent, AgentResult, CostCeilingExceeded, Pricing
+from llmstitch.providers.anthropic import AnthropicAdapter
+
+
+agent = Agent(
+    provider=AnthropicAdapter(),
+    model="claude-opus-4-7",
+    pricing=Pricing(input_per_mtok=15.00, output_per_mtok=75.00),
+    cost_ceiling=0.50,                           # USD — run halts if spend crosses this
+)
+
+result: AgentResult = await agent.run_with_result("Draft a short reply.")
+
+match result.stop_reason:
+    case "complete":        print(result.text)
+    case "cost_ceiling":    print(f"hit budget: {result.error}")
+    case "max_iterations":  print("loop overran")
+    case "error":           print(f"crashed: {type(result.error).__name__}")
+```
+
+`run_with_result()` never raises — it catches `MaxIterationsExceeded`, `CostCeilingExceeded`, and vendor errors into the returned `AgentResult` (with partial message history, usage, and cost). `run_stream_with_result()` is the streaming variant: same `StreamEvent`s as `run_stream`, then one terminal `AgentResultEvent`.
+
+The `cost_ceiling` check runs after each response is folded into the usage tally and outside the retry wrapper, so retries don't double-charge. `Agent.run()` / `Agent.run_stream()` still raise `CostCeilingExceeded` if you prefer classical error handling.
+
 ## More examples
 
 The [`examples/`](examples/) directory has runnable scripts for:
@@ -129,6 +189,14 @@ The [`examples/`](examples/) directory has runnable scripts for:
 - [`async_and_timeout.py`](examples/async_and_timeout.py) — async tools, per-call timeout, captured-exception semantics.
 - [`retries.py`](examples/retries.py) — `RetryPolicy` with backoff, jitter, and an `on_retry` observability hook.
 - [`token_counting.py`](examples/token_counting.py) — `Agent.count_tokens` on Anthropic + Gemini, with graceful fallback on adapters that don't support native counting.
+- [`observability.py`](examples/observability.py) — `EventBus` with a structured-logging subscriber that covers every event type.
+- [`cost_ceiling.py`](examples/cost_ceiling.py) — `cost_ceiling=` plus `run_with_result()`: one scenario completes, one scenario trips the ceiling; both inspect `result.stop_reason`.
+- [`streaming_with_result.py`](examples/streaming_with_result.py) — `run_stream_with_result()`: live `TextDelta` rendering plus a terminal `AgentResultEvent`, with `EventBus` side-channel progress.
+- [`tool_concurrency.py`](examples/tool_concurrency.py) — `is_read_only` / `is_concurrency_safe` flags, mixed-safety batches going sequential, all-safe batches going parallel, and a planner/executor split via `registry.read_only_subset()`.
+
+## Guide
+
+See [`GUIDE.md`](GUIDE.md) for a full walkthrough — core concepts, recipes, ten end-to-end agentic application patterns (research assistant, code review agent, support triage, SQL analyst, nested agents, production observability template), best practices, and a full API reference.
 
 ## Status
 

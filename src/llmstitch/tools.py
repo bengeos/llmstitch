@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import re
+import time
 import types as _pytypes
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -135,6 +136,8 @@ class Tool:
     input_schema: dict[str, Any]
     fn: ToolFunc
     is_async: bool
+    is_read_only: bool = False
+    is_concurrency_safe: bool = True
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -154,6 +157,8 @@ def tool(
     *,
     name: str | None = None,
     description: str | None = None,
+    is_read_only: bool = False,
+    is_concurrency_safe: bool = True,
 ) -> Any:
     """Decorator that turns a function into a `Tool`.
 
@@ -168,6 +173,8 @@ def tool(
             input_schema=schema,
             fn=f,
             is_async=inspect.iscoroutinefunction(f),
+            is_read_only=is_read_only,
+            is_concurrency_safe=is_concurrency_safe,
         )
 
     if fn is None:
@@ -200,43 +207,85 @@ class ToolRegistry:
     def definitions(self) -> list[ToolDefinition]:
         return [t.definition() for t in self._tools.values()]
 
+    def read_only_subset(self) -> ToolRegistry:
+        """Return a new registry containing only tools with `is_read_only=True`.
+
+        Shares the underlying `Tool` instances — the subset is a filtered view,
+        not a deep copy.
+        """
+        subset = ToolRegistry()
+        for t in self._tools.values():
+            if t.is_read_only:
+                subset._tools[t.name] = t
+        return subset
+
     async def run(
         self,
         calls: list[ToolUseBlock],
         *,
         timeout: float | None = None,
+        on_start: Callable[[ToolUseBlock], None] | None = None,
+        on_complete: Callable[[ToolUseBlock, ToolResultBlock, float], None] | None = None,
     ) -> list[ToolResultBlock]:
-        """Execute tool calls concurrently, preserving input order."""
+        """Execute tool calls, preserving input order.
+
+        Fans out with `asyncio.gather` when every resolved tool in the batch
+        is `is_concurrency_safe`; otherwise runs sequentially so unsafe tools
+        (e.g. ones that touch shared filesystem or DB state) don't race each
+        other. Unknown tools are treated as unsafe for the concurrency
+        decision.
+
+        Optional `on_start` / `on_complete` hooks are invoked synchronously
+        per call — used by `Agent` to emit observability events without
+        coupling the registry to the event bus.
+        """
 
         async def _one(use: ToolUseBlock) -> ToolResultBlock:
+            if on_start is not None:
+                on_start(use)
+            started = time.perf_counter()
             tool_obj = self._tools.get(use.name)
+            result: ToolResultBlock
             if tool_obj is None:
-                return ToolResultBlock(
+                result = ToolResultBlock(
                     tool_use_id=use.id,
                     content=f"Unknown tool: {use.name}",
                     is_error=True,
                 )
-            try:
-                coro: Awaitable[Any] = tool_obj.call(**use.input)
-                if timeout is not None:
-                    result = await asyncio.wait_for(coro, timeout=timeout)
-                else:
-                    result = await coro
-            except asyncio.TimeoutError:
-                return ToolResultBlock(
-                    tool_use_id=use.id,
-                    content=f"Tool '{use.name}' timed out after {timeout}s",
-                    is_error=True,
-                )
-            except Exception as exc:  # noqa: BLE001 — surface any tool error to the model
-                return ToolResultBlock(
-                    tool_use_id=use.id,
-                    content=f"{type(exc).__name__}: {exc}",
-                    is_error=True,
-                )
-            return ToolResultBlock(tool_use_id=use.id, content=_stringify(result))
+            else:
+                try:
+                    coro: Awaitable[Any] = tool_obj.call(**use.input)
+                    if timeout is not None:
+                        value = await asyncio.wait_for(coro, timeout=timeout)
+                    else:
+                        value = await coro
+                    result = ToolResultBlock(tool_use_id=use.id, content=_stringify(value))
+                except asyncio.TimeoutError:
+                    result = ToolResultBlock(
+                        tool_use_id=use.id,
+                        content=f"Tool '{use.name}' timed out after {timeout}s",
+                        is_error=True,
+                    )
+                except Exception as exc:  # noqa: BLE001 — surface any tool error to the model
+                    result = ToolResultBlock(
+                        tool_use_id=use.id,
+                        content=f"{type(exc).__name__}: {exc}",
+                        is_error=True,
+                    )
+            if on_complete is not None:
+                on_complete(use, result, time.perf_counter() - started)
+            return result
 
-        return list(await asyncio.gather(*(_one(c) for c in calls)))
+        all_safe = all(
+            (tool_obj := self._tools.get(c.name)) is not None and tool_obj.is_concurrency_safe
+            for c in calls
+        )
+        if all_safe:
+            return list(await asyncio.gather(*(_one(c) for c in calls)))
+        results: list[ToolResultBlock] = []
+        for c in calls:
+            results.append(await _one(c))
+        return results
 
 
 def _stringify(value: Any) -> str:
