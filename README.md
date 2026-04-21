@@ -48,6 +48,7 @@ print(messages[-1].content)
 - **Streaming** — `Agent.run_stream()` yields provider-neutral events (`TextDelta`, `ToolUseStart` / `Delta` / `Stop`, `MessageStop`, terminal `StreamDone`) and handles tool execution between turns.
 - **Retries** — opt in with a `RetryPolicy`; exponential backoff with jitter, honors `Retry-After` headers, uses each adapter's own transient-error classes.
 - **Token counting** — `Agent.count_tokens(prompt)` via native provider endpoints (Anthropic, Gemini).
+- **Usage and cost** — `agent.usage` (a `UsageTally`) accumulates tokens, turns, API calls, and retries across a run; `agent.cost()` prices it against a `Pricing` rate card in USD.
 - **Skills** — bundle a system prompt with a set of tools; compose with `.extend()`.
 - **PEP 561 typed** — ships with `py.typed`, fully checked under `mypy --strict`.
 
@@ -95,6 +96,26 @@ print(count.input_tokens)
 ```
 
 Available natively on `AnthropicAdapter` and `GeminiAdapter`. Other adapters raise `NotImplementedError` — llmstitch doesn't estimate with third-party tokenizers, since the counts can disagree with the provider's own.
+
+## Usage and cost
+
+```python
+from llmstitch import Agent, Pricing
+from llmstitch.providers.anthropic import AnthropicAdapter
+
+agent = Agent(
+    provider=AnthropicAdapter(),
+    model="claude-opus-4-7",
+    pricing=Pricing(input_per_mtok=15.00, output_per_mtok=75.00),  # paste from vendor rate card
+)
+
+await agent.run("Summarize the Iliad in three sentences.")
+
+print(agent.usage)         # UsageTally(input_tokens=..., output_tokens=..., turns=1, api_calls=1, retries=0)
+print(agent.cost().total)  # USD
+```
+
+`agent.usage` accumulates across every `run` / `run_stream` on that agent — tokens (fed by adapters that report usage), `turns` (model responses folded in), `api_calls` (provider invocations), and `retries` (from the retry policy). Call `agent.usage.reset()` to zero the counters between logical sessions, or `usage.cost(other_pricing)` directly to price the same tally against a different rate card. The default `Pricing(1.00, 2.00)` is a placeholder — pass real vendor rates for accurate costs.
 
 ## More examples
 

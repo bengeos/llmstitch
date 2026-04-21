@@ -70,21 +70,43 @@ All cross-boundary types live here. Nothing downstream of this file should impor
 | `Message` | `role: Role`, `content: str \| list[ContentBlock]` | Mutable; helpers `text_blocks()`, `tool_uses()`. |
 | `ToolDefinition` | `name`, `description`, `input_schema: dict` | JSON-Schema shape; adapters translate to vendor wire format. |
 | `CompletionResponse` | `content: list[ContentBlock]`, `stop_reason: str`, `usage: dict \| None`, `raw: Any` | `raw` keeps the vendor response object for escape hatches — `repr=False` so logs stay readable. |
+| `TokenCount` | `input_tokens: int`, `output_tokens: int \| None`, `details: dict \| None` | Pre-call counts set `output_tokens=None`. `details` is a loose bag for provider-specific breakdowns (cache hits, etc.) so the shape can grow without breaking the dataclass. |
+| `UsageTally` | `input_tokens`, `output_tokens`, `turns`, `api_calls`, `retries` (+ `total_tokens` property) | Mutated in place by `Agent.run` / `run_stream`. `add(usage)` folds a `CompletionResponse.usage` dict and bumps `turns`; `record_call` / `record_retry` tick call-activity counters; `cost(pricing)` prices the tally; `reset()` zeroes everything. **Not safe to mutate from multiple coroutines against the same agent** — neither is the run loop. |
+| `Pricing` | `input_per_mtok: float`, `output_per_mtok: float` | USD per 1M tokens, matching vendor rate cards so you can paste numbers directly. Cached-input / reasoning / batch-discount rates are out of scope. |
+| `Cost` | `input_cost`, `output_cost` (+ `total` property) | USD breakdown produced by `UsageTally.cost(pricing)` / `Agent.cost()`. |
+| Streaming events | `TextDelta`, `ToolUseStart`, `ToolUseDelta`, `ToolUseStop`, `MessageStop`, `StreamDone(CompletionResponse)` — union `StreamEvent` | See §7.3 for the full contract. |
 
 **Rule:** if you find yourself adding a vendor-specific field to `types.py`, you're probably leaking. Add it to an adapter instead.
 
 ### 3.2 `agent.py` — the run loop
 
-One dataclass (`Agent`), one driver method (`run`), one sync wrapper (`run_sync`). The loop (`src/llmstitch/agent.py:27`) does exactly this:
+One dataclass (`Agent`) with three driver methods — `run` (async), `run_sync` (thin `asyncio.run` wrapper), and `run_stream` (streaming variant, see §7.3) — plus `count_tokens` (async) and `cost` (sync) for introspection. Agent configuration:
 
-1. Normalize the prompt into a `list[Message]`.
-2. Call `provider.complete(...)` with the current history.
-3. Append the assistant response to history.
-4. If the response contains no `ToolUseBlock`s → return the history.
-5. Otherwise run all tool calls via `ToolRegistry.run`, append the `ToolResultBlock`s as a new user-role message, and loop.
-6. If `max_iterations` is exhausted without a text-only response, raise `MaxIterationsExceeded` (not a return value — callers should distinguish "loop terminated" from "model didn't stop").
+| Field | Default | Notes |
+|---|---|---|
+| `provider` | required | A `ProviderAdapter` instance. |
+| `model` | required | Passed through to the adapter verbatim. |
+| `tools` | `ToolRegistry()` | Empty registry; `agent.tools.register(...)` to add. |
+| `system` | `None` | Top-level system prompt. |
+| `max_iterations` | `10` | Hard cap on model-turn count per `run` / `run_stream`. |
+| `tool_timeout` | `30.0` | Seconds; applied per tool call by `ToolRegistry.run`. |
+| `max_tokens` | `4096` | Forwarded to the adapter. |
+| `retry_policy` | `None` | Optional `RetryPolicy`; see §3.6. |
+| `pricing` | `Pricing(1.00, 2.00)` | **Placeholder rates** — pass a real `Pricing(...)` for accurate `cost()`. |
+| `usage` | `UsageTally()` | Mutated in place as the agent runs; inspect or `reset()` any time. |
 
-The loop is deliberately dumb: no retries, no backoff. Streaming is a separate entry point (`Agent.run_stream`, added in v0.1.2) — see §7.3.
+The non-streaming loop (`src/llmstitch/agent.py:44`):
+
+1. `_normalize_prompt(prompt)` coerces a `str` into `[Message(role="user", content=prompt)]`; a `list[Message]` is copied.
+2. `_instrumented_policy()` wraps `retry_policy.on_retry` with a shim that ticks `usage.retries` before forwarding to the user's callback (if any). Returns `None` when no policy is set, so `retry_call` short-circuits.
+3. For each iteration (up to `max_iterations`):
+   - Call `provider.complete(**self._provider_kwargs(messages))` through `retry_call(policy, _complete)`. `_complete` ticks `usage.api_calls` once per invocation.
+   - `_apply_response(response, messages)` folds the result: `usage.add(response.usage)`, appends the assistant message, runs tool calls in parallel via `ToolRegistry.run`, appends the `ToolResultBlock`s as a new user-role message, and returns `True` to continue or `False` to stop.
+4. If `max_iterations` is exhausted without a text-only response, raise `MaxIterationsExceeded` (not a return value — callers should distinguish "loop terminated" from "model didn't stop").
+
+The loop is deliberately dumb: tool execution is parallel, but there is no provider-side orchestration (no reranking, no speculative tool calls, no self-critique). Retries are opt-in via `retry_policy`. Streaming is a separate entry point (`Agent.run_stream`, added in v0.1.2) — see §7.3. Usage accumulation and pricing are covered in §3.7.
+
+The `_normalize_prompt` / `_provider_kwargs` / `_apply_response` helpers are private by convention (leading underscore) but are the seam through which `run` and `run_stream` share behavior. **Don't duplicate prompt-normalization or provider-kwarg construction in a new entry point — reuse the helpers.**
 
 ### 3.3 `tools.py` — decorator, schema generator, registry, skills
 
@@ -164,15 +186,34 @@ The Groq and OpenRouter adapters illustrate the extension story: if a provider s
 
 ### 3.6 `retry.py` — backoff for provider calls
 
-`RetryPolicy` is a frozen dataclass (`max_attempts`, `initial_delay`, `max_delay`, `multiplier`, `jitter`, `retry_on`, `respect_retry_after`, `on_retry`). `retry_call(policy, factory)` invokes a zero-arg coroutine factory, catches any exception in `policy.retry_on`, and sleeps `initial * multiplier**(attempt-1)` seconds (capped at `max_delay`, jittered within `±policy.jitter`). If `respect_retry_after=True` and the exception carries a `Retry-After` header or `retry_after` attribute, that value becomes the delay *floor*. When `policy is None` the helper short-circuits to a single awaited call — zero overhead in the no-retry path.
+`RetryPolicy` is a frozen dataclass (`max_attempts`, `initial_delay`, `max_delay`, `multiplier`, `jitter`, `retry_on`, `respect_retry_after`, `on_retry`). `retry_call(policy, factory)` invokes a zero-arg coroutine factory, catches any exception in `policy.retry_on`, and sleeps `initial * multiplier**(attempt-1)` seconds (capped at `max_delay`, jittered within `±policy.jitter`). If `respect_retry_after=True` and the exception carries a `Retry-After` header or `retry_after` attribute, that value becomes the delay *floor*. When `policy is None`, `max_attempts <= 1`, or `retry_on` is empty, the helper short-circuits to a single awaited call — zero overhead in the no-retry path.
 
-`Agent.run` wraps `provider.complete(...)` in `retry_call(self.retry_policy, ...)`. The factory closes over `messages`; since history is only mutated *after* a successful response, every retry within a turn observes the same pre-turn state — no need to snapshot.
+`Agent.run` wraps `provider.complete(...)` in `retry_call(self._instrumented_policy(), _complete)`. The factory closes over `messages`; since history is only mutated *after* a successful response, every retry within a turn observes the same pre-turn state — no need to snapshot. `_instrumented_policy()` returns a `replace`d copy of `retry_policy` with `on_retry` wrapped so `usage.retries` ticks before the user's callback (if any) fires.
+
+Each adapter's `default_retryable()` classmethod returns the tuple of vendor-SDK exception classes that warrant retry (rate limits, timeouts, connection drops, 5xx). The SDK import happens *inside* the classmethod so invoking it on an adapter whose extra isn't installed raises `ImportError` at the point of use — not at module import. Typical wiring:
+
+```python
+RetryPolicy(retry_on=AnthropicAdapter.default_retryable(), max_attempts=3)
+```
 
 **Streaming is deliberately not retried.** Once a `TextDelta` has been yielded from `Agent.run_stream`, the caller may already have rendered it — there's no safe rollback. Retrying only the *initial* stream-open would require refactoring every adapter's `stream()` to split "open the SDK stream" from "consume events," which we defer. `run_stream` therefore propagates provider exceptions unchanged.
 
-### 3.7 `__init__.py` — the curated public surface
+### 3.7 Usage tracking and pricing
 
-Everything users should need is re-exported here (`Agent`, `tool`, `Tool`, `Skill`, `ToolRegistry`, the `types.py` dataclasses, `MaxIterationsExceeded`, `__version__`). **Adapters are deliberately *not* re-exported at the top level** — users import `llmstitch.providers.anthropic` explicitly. This keeps the lazy-import guarantee intact: `import llmstitch` never triggers any vendor SDK.
+`Agent` carries a mutable `UsageTally` (`agent.usage`) updated every time a model turn completes. Two kinds of counters:
+
+- **Token counters** — `input_tokens`, `output_tokens`, `turns`. Fed by `usage.add(response.usage)` inside `_apply_response`. If an adapter doesn't report usage, `add(None)` is a no-op.
+- **Call-activity counters** — `api_calls`, `retries`. Fed by `record_call()` (one bump per `provider.complete(...)` / `provider.stream(...)` invocation) and `record_retry()` (one bump per retry attempt, via the instrumented `on_retry`).
+
+Identity: on a successful run with usage-reporting providers, `api_calls == turns + retries`. A run that exhausts the retry policy and raises will leave `turns` one lower than that identity predicts (the last attempt bumped `api_calls` and `retries` but never produced a response to add).
+
+`UsageTally.cost(pricing: Pricing) -> Cost` computes USD totals at the given per-1M-token rates. `Agent.cost()` is the sugar — it prices `self.usage` against `self.pricing`. The default `Pricing(1.00, 2.00)` is **a placeholder, not any real model's rates**; there is deliberately no built-in per-model rate table because vendor prices change and a stale source of truth in the library is worse than making the caller paste numbers from the rate card.
+
+Concurrency: `UsageTally` is not safe to mutate from multiple coroutines running against the same `Agent` — neither is the run loop itself. If you need per-request accounting, run one `Agent` per logical session or `reset()` between batches.
+
+### 3.8 `__init__.py` — the curated public surface
+
+Everything users should need is re-exported here (`Agent`, `tool`, `Tool`, `Skill`, `ToolRegistry`, the `types.py` dataclasses — including streaming events, `TokenCount`, `UsageTally`, `Pricing`, `Cost` — `RetryPolicy`, `RetryAttempt`, `MaxIterationsExceeded`, `__version__`). **Adapters are deliberately *not* re-exported at the top level** — users import `llmstitch.providers.anthropic` explicitly. This keeps the lazy-import guarantee intact: `import llmstitch` never triggers any vendor SDK.
 
 `__version__` is read via `importlib.metadata.version("llmstitch")` with a `"0.0.0+local"` fallback for editable layouts where package metadata may be absent.
 
@@ -363,9 +404,14 @@ Tracked on the roadmap, not yet implemented:
 - **Structured-output helpers** — no JSON-mode / schema-constrained-decoding wrapper.
 - **MCP integration** — on the roadmap per the README.
 - **Streaming retries** — `run_stream` does not retry today; see §3.6 for why. A future version may retry the initial stream-open, once adapters are refactored to separate that from event consumption.
+- **Cached-input / reasoning / batch-discount pricing** — `Pricing` carries only `input_per_mtok` and `output_per_mtok`. If you need to price the other lines on a vendor rate card, compute from raw token counts until the shape grows.
+- **Built-in per-model rate table** — deliberately out of scope; prices change and a stale source of truth in the library is worse than making callers paste from the rate card.
+- **Token counting on OpenAI-family adapters** — `OpenAIAdapter`, `GroqAdapter`, and `OpenRouterAdapter` raise `NotImplementedError` from `count_tokens`. We don't estimate with third-party tokenizers that may disagree with the provider's own count.
 
-Landed earlier:
-- **Retries / backoff** (v0.1.3) — see §3.6.
-- **Token counting** (v0.1.3) — `count_tokens()` on Anthropic and Gemini adapters; see §3.4.
+Landed in v0.1.3:
+- **Retries / backoff** — see §3.6.
+- **Token counting** — `count_tokens()` on Anthropic and Gemini adapters; see §3.4 and §3.7.
+- **Usage tracking and pricing** — `Agent.usage` (`UsageTally`) and `Agent.cost()` (`Pricing` → `Cost`); see §3.7.
+- **Agent refactor** — `run()` and `run_stream()` share the `_normalize_prompt` / `_provider_kwargs` / `_apply_response` helpers; `count_tokens()` reuses `_normalize_prompt`. No behavior change; test suite unchanged.
 
 Adding any of the remaining items is a v0.2.x (minor-bump) concern and likely requires extending `ProviderAdapter` — do that behind default implementations that degrade gracefully, so existing adapters don't all need to change at once.
