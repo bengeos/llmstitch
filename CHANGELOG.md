@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-21
+
+### Added
+- `OpenRouterAdapter` (`llmstitch.providers.openrouter`) for the OpenRouter API. OpenRouter speaks the OpenAI Chat Completions wire format, so the adapter subclasses `OpenAIAdapter` and only overrides `__init__` to point the `openai` SDK at `https://openrouter.ai/api/v1`, read `OPENROUTER_API_KEY`, and pass optional `HTTP-Referer` / `X-Title` ranking headers. Enabled via the new `llmstitch[openrouter]` extra (reuses `openai>=1.50`; no new SDK dependency) and rolled into `llmstitch[all]`.
+- **Streaming.** `ProviderAdapter.stream()` is now implemented on `AnthropicAdapter`, `OpenAIAdapter`, `GeminiAdapter` (and inherited by `GroqAdapter` / `OpenRouterAdapter`), yielding a sequence of `StreamEvent`s — `TextDelta`, `ToolUseStart` / `ToolUseDelta` / `ToolUseStop`, `MessageStop`, and a terminal `StreamDone(CompletionResponse)`. New `Agent.run_stream(prompt)` drives the model → tool → model loop incrementally, yielding events per model turn and running tools silently between turns.
+- New public types exported from `llmstitch`: `TextDelta`, `ToolUseStart`, `ToolUseDelta`, `ToolUseStop`, `MessageStop`, `StreamDone`, `StreamEvent`.
+- `ARCHITECTURE.md` — contributor-facing walkthrough of the request pipeline, adapter contract, streaming event model, and release flow.
+- `examples/streaming.py`, `examples/providers_gallery.py`, `examples/parallel_tools.py`, `examples/async_and_timeout.py` — runnable end-to-end examples for the new streaming surface and pre-existing behaviors.
+
+### Changed
+- **Breaking (but safe):** `ProviderAdapter.stream` signature changed from `AsyncIterator[CompletionResponse]` to `AsyncIterator[StreamEvent]`. The prior signature only ever raised `NotImplementedError`, so no working caller can depend on it.
+- CI workflow installs the `openrouter` extra alongside the other adapters.
+- `tests/conftest.py` `FakeAdapter` now implements `stream()` — by default it auto-decomposes scripted `CompletionResponse`s into a plausible event sequence; pass `stream_scripts=` to script specific event orderings.
+
 ## [0.1.1] - 2026-04-21
 
 ### Added

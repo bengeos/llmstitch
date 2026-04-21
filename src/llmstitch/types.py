@@ -53,6 +53,44 @@ class ToolDefinition:
     input_schema: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class TextDelta:
+    """Incremental text chunk emitted during streaming."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolUseStart:
+    """A new tool-use block is beginning during streaming."""
+
+    id: str
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolUseDelta:
+    """A partial fragment of a tool-use block's JSON-encoded input."""
+
+    id: str
+    partial_json: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolUseStop:
+    """A tool-use block has finished streaming."""
+
+    id: str
+
+
+@dataclass(frozen=True, slots=True)
+class MessageStop:
+    """The model has finished producing this message."""
+
+    stop_reason: str
+    usage: dict[str, int] | None = None
+
+
 @dataclass(slots=True)
 class CompletionResponse:
     content: list[ContentBlock]
@@ -65,3 +103,18 @@ class CompletionResponse:
 
     def text(self) -> str:
         return "".join(b.text for b in self.content if isinstance(b, TextBlock))
+
+
+@dataclass(frozen=True, slots=True)
+class StreamDone:
+    """Terminal streaming event carrying the fully-assembled response.
+
+    Adapters must emit exactly one `StreamDone` as the final event so callers
+    (including `Agent.run_stream`) can feed the complete message back into the
+    tool-execution loop without re-accumulating from deltas.
+    """
+
+    response: CompletionResponse
+
+
+StreamEvent = TextDelta | ToolUseStart | ToolUseDelta | ToolUseStop | MessageStop | StreamDone

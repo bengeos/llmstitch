@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from ..types import (
     CompletionResponse,
     ContentBlock,
     Message,
+    MessageStop,
+    StreamDone,
+    StreamEvent,
     TextBlock,
+    TextDelta,
     ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
+    ToolUseDelta,
+    ToolUseStart,
+    ToolUseStop,
 )
 from .base import ProviderAdapter
 
@@ -115,4 +123,80 @@ class AnthropicAdapter(ProviderAdapter):
             stop_reason=getattr(response, "stop_reason", "end_turn") or "end_turn",
             usage=usage,
             raw=response,
+        )
+
+    async def stream(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        system: str | None = None,
+        tools: list[ToolDefinition] | None = None,
+        max_tokens: int = 4096,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamEvent]:
+        translated = self.translate_messages(messages)
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": translated,
+            "max_tokens": max_tokens,
+        }
+        if system:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = self.translate_tools(tools)
+        payload.update(kwargs)
+
+        # Track tool-use ids by content_block index so we can emit matching stops.
+        tool_ids_by_idx: dict[int, str] = {}
+        # Cast to Any at the SDK boundary — mirrors `parse_response(response: Any)`.
+        # The SDK's tagged-union event types are narrower than our runtime checks need.
+        stream_ctx: Any = self._client.messages.stream(**payload)
+        async with stream_ctx as stream:
+            async for event in stream:
+                etype = getattr(event, "type", "")
+                if etype == "content_block_start":
+                    block = event.content_block
+                    btype = getattr(block, "type", "")
+                    if btype == "tool_use":
+                        tool_ids_by_idx[event.index] = block.id
+                        yield ToolUseStart(id=block.id, name=block.name)
+                elif etype == "content_block_delta":
+                    delta = event.delta
+                    dtype = getattr(delta, "type", "")
+                    if dtype == "text_delta":
+                        yield TextDelta(text=delta.text)
+                    elif dtype == "input_json_delta":
+                        tool_id = tool_ids_by_idx.get(event.index, "")
+                        yield ToolUseDelta(id=tool_id, partial_json=delta.partial_json)
+                elif etype == "content_block_stop":
+                    stop_id = tool_ids_by_idx.get(event.index)
+                    if stop_id is not None:
+                        yield ToolUseStop(id=stop_id)
+            final_message: Any = await stream.get_final_message()
+
+        content: list[ContentBlock] = []
+        for block in final_message.content:
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                content.append(TextBlock(text=block.text))
+            elif btype == "tool_use":
+                content.append(ToolUseBlock(id=block.id, name=block.name, input=dict(block.input)))
+        usage = None
+        raw_usage = getattr(final_message, "usage", None)
+        if raw_usage is not None:
+            usage = {
+                "input_tokens": getattr(raw_usage, "input_tokens", 0),
+                "output_tokens": getattr(raw_usage, "output_tokens", 0),
+            }
+        stop_reason = getattr(final_message, "stop_reason", "end_turn") or "end_turn"
+
+        yield MessageStop(stop_reason=stop_reason, usage=usage)
+        yield StreamDone(
+            response=CompletionResponse(
+                content=content,
+                stop_reason=stop_reason,
+                usage=usage,
+                raw=final_message,
+            )
         )

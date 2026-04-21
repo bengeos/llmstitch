@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llmstitch"
-version = "0.1.1"
+version = "0.1.2"
 description = "A provider-agnostic LLM toolkit with tool calling, skills, and parallel execution."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [
   { name = "Biniam Kassahun", email = "george.beng@gmail.com" },
 ]
-keywords = ["llm", "anthropic", "openai", "gemini", "groq", "tool-calling", "agents", "ai"]
+keywords = ["llm", "anthropic", "openai", "gemini", "groq", "openrouter", "tool-calling", "agents", "ai"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -32,7 +32,8 @@ anthropic = ["anthropic>=0.40"]
 openai    = ["openai>=1.50"]
 gemini    = ["google-genai>=0.3"]
 groq      = ["groq>=0.9"]
-all       = ["llmstitch[anthropic,openai,gemini,groq]"]
+openrouter = ["openai>=1.50"]
+all       = ["llmstitch[anthropic,openai,gemini,groq,openrouter]"]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
