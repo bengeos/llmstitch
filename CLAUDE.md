@@ -2,58 +2,59 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project status
+## Project overview
 
-This repository is **pre-implementation**. The only file is `plan.md`, which specifies a Python library to be built and published to PyPI as **`llmstitch`** (distribution name == import name). The prototype code referenced by the plan (named `llmkit`) lives elsewhere and has not yet been copied in. Read `plan.md` before any structural work — it is the authoritative spec for layout, versioning, CI, and release.
+`llmstitch` is a Python library published to PyPI (distribution name == import name) that puts Anthropic, OpenAI, and Gemini behind one `Agent` run loop with a typed tool-calling layer. Current release is v0.1.0 alpha; `plan.md` was the original spec and has been removed from the working tree (visible in `git status`). The authoritative surface now is `src/llmstitch/__init__.py`, `README.md`, and `CHANGELOG.md`.
 
-## Locked-in decisions (from plan.md)
+## Common commands
+
+```bash
+pip install -e ".[dev,anthropic,openai,gemini]"   # dev install with all extras (mirrors CI)
+pytest -v                                         # run tests
+pytest -v --cov=llmstitch --cov-report=term-missing
+pytest tests/test_tools.py::test_tool_schema_basic  # single test
+ruff check src tests
+ruff format --check src tests                     # CI enforces formatting too
+mypy src                                          # strict mode; see pyproject.toml
+python -m build                                   # wheel + sdist into dist/
+twine check dist/*                                # validate README rendering before upload
+pre-commit install                                # once, to enable ruff + mypy on commit
+```
+
+## Locked-in project decisions
 
 - **Package / import name:** `llmstitch` (both must match).
 - **Build backend:** Hatchling. All metadata in `pyproject.toml`; no `setup.py` / `setup.cfg`.
-- **Layout:** `src/llmstitch/` — the `src/` layout is mandatory, not optional (prevents "works locally, breaks installed" bugs).
-- **License:** MIT.
-- **Python support:** `>=3.10`, tested against 3.10–3.13.
-- **Provider SDKs are extras, not core deps:** `pip install llmstitch` installs a tiny core; users opt in via `llmstitch[anthropic]`, `[openai]`, `[gemini]`, or `[all]`. Provider imports inside adapters must be lazy so the core stays light.
-- **Typed package:** ship an empty `src/llmstitch/py.typed` marker (PEP 561).
-- **Versioning:** SemVer. Start at `0.1.0`; single source of truth is `pyproject.toml`, with `__init__.py` reading back via `importlib.metadata.version("llmstitch")`. Consider `hatch-vcs` later.
+- **Layout:** `src/llmstitch/` — the `src/` layout is mandatory (prevents "works locally, breaks installed" bugs).
+- **License:** MIT. Python `>=3.10`, tested on 3.10–3.13.
+- **Provider SDKs are extras, never core deps.** `pip install llmstitch` installs a zero-dependency core; users opt in with `llmstitch[anthropic]`, `[openai]`, `[gemini]`, or `[all]`. Every adapter imports its vendor SDK **lazily inside `__init__` or `complete`** so the core import stays light — do not move these imports to module top-level.
+- **Typed package:** `src/llmstitch/py.typed` is a PEP 561 marker; keep it empty.
+- **Versioning:** SemVer. `pyproject.toml` is the single source of truth; `__init__.py` reads back via `importlib.metadata.version("llmstitch")` with a `PackageNotFoundError` fallback to `"0.0.0+local"` for editable/dev layouts.
+- **mypy is `strict = true`** with `ignore_missing_imports = true` — this is intentional: vendor SDKs are optional extras and CI must not hard-fail when one is absent. Don't flip that flag to get stricter errors.
 
-## Intended architecture
+## Architecture
 
-The library stitches multiple LLM providers behind one interface. Key modules once code is imported:
+Every request flows through the same pipeline: `Agent.run` → `ProviderAdapter.complete` → translate tool calls → `ToolRegistry.run` (parallel) → feed `ToolResultBlock`s back → repeat until the model stops calling tools or `max_iterations` is hit.
 
-- `types.py` — `Message`, `Role`, `TextBlock`, `ToolUseBlock`, `ToolResultBlock`, `ToolDefinition`, `CompletionResponse`. Provider-neutral.
-- `providers/` — each provider in its own file (`anthropic.py`, `openai.py`, `gemini.py`) behind a `ProviderAdapter` ABC in `base.py`. Lazy-import the vendor SDK inside the adapter.
-- `tools.py` — `@tool` decorator, `Tool`, `ToolRegistry`, `Skill`. Decorator generates JSON schema from type hints (handles defaults, `Optional`, async).
-- `agent.py` — `Agent` class and the run loop that drives provider → tool calls → feedback → provider until termination or `max_iterations`.
-- `__init__.py` — curated public API: `Agent`, `tool`, `Tool`, `Skill`, `ToolRegistry`, and the `types` re-exports. Users should never need to import from submodules.
-
-## Planned commands
-
-Once `pyproject.toml` exists:
-
-```bash
-pip install -e ".[dev]"                           # dev install with test/lint tooling
-pytest -v                                         # run tests
-pytest -v --cov=llmstitch --cov-report=term-missing
-pytest tests/test_tools.py::test_name             # single test
-ruff check src tests
-mypy src
-python -m build                                   # build wheel + sdist into dist/
-twine check dist/*                                # validate README rendering before upload
-```
+- **`types.py`** — provider-neutral dataclasses: `Message`, `Role`, `TextBlock`, `ToolUseBlock`, `ToolResultBlock`, `ToolDefinition`, `CompletionResponse`. These are the *only* types that cross the adapter boundary; never leak vendor SDK types into `agent.py` or `tools.py`.
+- **`providers/base.py`** — `ProviderAdapter` ABC with `complete()` (implemented) and `stream()` (raises `NotImplementedError` on v0.1.0; lands in v0.2.0).
+- **`providers/{anthropic,openai,gemini}.py`** — each adapter translates `Message`/`ToolDefinition` to the vendor wire format and parses the response back into `ContentBlock`s. The Anthropic adapter strips `role="system"` messages because the Messages API takes `system` as a top-level param — other adapters may handle system prompts differently, so check the specific `translate_messages` before assuming parity.
+- **`tools.py`** — `@tool` decorator builds a JSON Schema from type hints (handles `Optional`, `Literal`, `list[...]`, `dict[str, V]`, defaults, async functions) plus a best-effort Google-style docstring parser for parameter descriptions. `ToolRegistry.run` dispatches calls via `asyncio.gather`, preserves input order, applies an optional per-call timeout, and captures any exception as a `ToolResultBlock(is_error=True)` — the model sees the error rather than the process crashing. `Skill` bundles a system prompt with tools and supports functional *or* class-style construction plus `.extend()` for prompt/tool merging.
+- **`agent.py`** — `Agent.run` is the loop; `run_sync` is a thin `asyncio.run` wrapper. `MaxIterationsExceeded` is raised (not returned) when the loop runs out.
+- **`__init__.py`** — curated public surface. Anything users should import lives in `__all__`; users should never need to reach into submodules *except* for the concrete adapters in `llmstitch.providers.<name>` (kept out of the top-level namespace so the lazy-import property is preserved).
 
 ## Testing rules
 
-- **No live API calls in CI** — ever. All provider adapter tests use a fake `ProviderAdapter`. If real-provider integration tests are added, isolate them under `tests/integration/` and gate on an env var so they never run in CI.
-- `pytest-asyncio` with `asyncio_mode = "auto"` (already in the planned `pyproject.toml`).
+- **No live API calls in CI — ever.** Every adapter test uses the `FakeAdapter` in `tests/conftest.py`, which replays a scripted list of `CompletionResponse`s and records every `complete()` call for assertions. If real-provider integration tests are ever added, isolate them under `tests/integration/` and gate on an env var so they never run in CI.
+- `pytest-asyncio` runs in `asyncio_mode = "auto"` (set in `pyproject.toml`), so async tests don't need the `@pytest.mark.asyncio` decorator.
 
 ## Release process
 
-- CI (`.github/workflows/ci.yml`) runs lint + mypy + pytest on push/PR across Python 3.10–3.13.
-- Release (`.github/workflows/release.yml`) fires on tags matching `v*` and publishes via **PyPI Trusted Publishing** (OIDC) — no API tokens in the repo or GitHub secrets.
-- Release flow: bump version in `pyproject.toml` → update `CHANGELOG.md` → commit → `git tag v0.x.y` → `git push --tags`. GitHub Actions does the rest.
-- The very first release must be published manually with `twine upload` to claim the name; Trusted Publishing is configured on the PyPI project page afterward.
+- **CI** (`.github/workflows/ci.yml`) runs ruff + ruff-format + mypy + pytest on Python 3.10–3.13 for every push to `main` and every PR. It installs `".[dev,anthropic,openai,gemini]"` so adapter tests can import vendor SDKs if needed.
+- **Release** (`.github/workflows/release.yml`) fires on tags matching `v*` and publishes via **PyPI Trusted Publishing** (OIDC, environment `pypi`) — there are no API tokens in the repo or GitHub secrets, and there should never be.
+- Normal flow: bump `version` in `pyproject.toml` → update `CHANGELOG.md` → commit → `git tag v0.x.y` → `git push --tags`.
+- The very first PyPI release must be published manually with `twine upload` to claim the name; Trusted Publishing is configured on the PyPI project page afterward. Subsequent releases go via the tag workflow.
 
-## Phased roadmap
+## Roadmap notes
 
-v0.1.0 ships Anthropic adapter only; other providers raise `NotImplementedError`. Streaming lands in v0.2.0, OpenAI in v0.3.0, Gemini in v0.4.0. Don't pull work forward across these boundaries unless asked — the plan is explicit about shipping a skeleton first.
+v0.1.0 shipped all three adapters (this diverges from the earlier plan, which intended Anthropic-only in 0.1.0 — don't re-gate the other two). `stream()` raising `NotImplementedError` is the actual 0.1.0 limitation; streaming, retries/backoff, token counting helpers, and structured-output helpers are all still on the roadmap.
