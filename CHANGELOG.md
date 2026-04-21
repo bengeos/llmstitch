@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-04-22
+
+### Added
+- **EventBus / observability.** New `llmstitch.events` module with frozen event dataclasses (`AgentStarted`, `TurnStarted`, `ModelRequestSent`, `ModelResponseReceived`, `ToolExecutionStarted`, `ToolExecutionCompleted`, `UsageUpdated`, `AgentStopped`) and an `EventBus` that supports both synchronous subscribers (`bus.subscribe(cb)`) and SSE-style async iteration (`async for event in bus.stream(): ...`). `Agent` gains an optional `event_bus: EventBus | None = None` field; when `None`, emission is a no-op with zero overhead. Events are emitted at run start, turn start, before/after each provider call, before/after each tool call, on usage delta, and on run stop (with `stop_reason`). Events flow through the bus only — they are **not** interleaved into the `AsyncIterator[StreamEvent]` returned by `Agent.run_stream()`; subscribe to the bus to observe a streaming run.
+- **Non-raising `run_with_result()` and cost ceiling.** New `AgentResult` dataclass (`messages`, `text`, `stop_reason`, `turns`, `usage`, `cost`, `error`) with `stop_reason: Literal["complete", "max_iterations", "cost_ceiling", "error"]`. New `Agent.run_with_result(prompt) -> AgentResult` never raises — it catches `MaxIterationsExceeded`, `CostCeilingExceeded`, and vendor errors into the result. New `Agent.run_stream_with_result(prompt)` yields `StreamEvent`s and ends with an `AgentResultEvent` carrying the final `AgentResult`. New `cost_ceiling: float | None = None` field on `Agent`; after each provider-reported usage is folded into the tally, the running cost is computed against `self.pricing` and `CostCeilingExceeded(spent, ceiling)` is raised if exceeded. The check runs outside the retry wrapper, so retries are not double-charged.
+- **`CostCeilingExceeded` exception** (new `llmstitch.errors` module). `MaxIterationsExceeded` now lives in the same module and is re-exported from `llmstitch.agent` for backwards compatibility.
+- **Tool concurrency flags.** `Tool` and the `@tool` decorator accept `is_read_only: bool = False` and `is_concurrency_safe: bool = True`. `ToolRegistry.run` inspects the batch: if every resolved tool is concurrency-safe, it fans out with `asyncio.gather` (current behavior); otherwise it runs sequentially preserving input order. Unknown tools are treated as unsafe for the concurrency decision. `ToolRegistry.run` also accepts optional `on_start` / `on_complete` hooks used by `Agent` to emit tool events. `ToolRegistry.read_only_subset() -> ToolRegistry` returns a new registry containing only tools with `is_read_only=True` (sharing the underlying `Tool` instances).
+- New public exports: `EventBus`, `Event`, `AgentStarted`, `TurnStarted`, `ModelRequestSent`, `ModelResponseReceived`, `ToolExecutionStarted`, `ToolExecutionCompleted`, `UsageUpdated`, `AgentStopped`, `AgentResultEvent`, `AgentResult`, `CostCeilingExceeded`.
+
+### Notes
+- `Agent.run()`, `Agent.run_stream()`, and `Agent.run_sync()` continue to raise on `MaxIterationsExceeded` and `CostCeilingExceeded` — the new result-returning variants are additive and opt-in.
+- Because the library has no built-in per-model rate table, cost-ceiling enforcement requires you to pass `pricing=Pricing(...)`; the placeholder default (`$1/$2` per 1M tokens) will still trigger the ceiling, but against placeholder numbers.
+- Tool flag defaults (`is_read_only=False`, `is_concurrency_safe=True`) preserve v0.1.3 behavior for every existing tool — the full v0.1.3 test suite (95 tests) passes unchanged.
+
 ## [0.1.3] - 2026-04-22
 
 ### Added
