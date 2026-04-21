@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 from llmstitch.providers.anthropic import AnthropicAdapter
 from llmstitch.providers.gemini import GeminiAdapter
+from llmstitch.providers.groq import GroqAdapter
 from llmstitch.providers.openai import OpenAIAdapter
 from llmstitch.types import (
     Message,
@@ -215,3 +216,34 @@ def test_gemini_parse_response_empty_candidates() -> None:
     resp = GeminiAdapter.parse_response(raw)
     assert resp.content == []
     assert resp.stop_reason == "empty"
+
+
+# ---------- Groq ---------- #
+
+
+def test_groq_reuses_openai_translation() -> None:
+    # Groq's wire format matches OpenAI's, so the adapter inherits translation
+    # directly. Verify the static methods resolve to the same implementations.
+    assert GroqAdapter.translate_messages is OpenAIAdapter.translate_messages
+    assert GroqAdapter.translate_tools is OpenAIAdapter.translate_tools
+    assert GroqAdapter.parse_response is OpenAIAdapter.parse_response
+
+
+def test_groq_translate_messages_with_tools() -> None:
+    msgs = [
+        Message(role="user", content="hi"),
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="call_1", name="f", input={"x": 1})],
+        ),
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="call_1", content="42")],
+        ),
+    ]
+    out = GroqAdapter.translate_messages(msgs, system="be helpful")
+    assert out[0] == {"role": "system", "content": "be helpful"}
+    assert out[1] == {"role": "user", "content": "hi"}
+    assert out[2]["tool_calls"][0]["id"] == "call_1"
+    assert json.loads(out[2]["tool_calls"][0]["function"]["arguments"]) == {"x": 1}
+    assert out[3] == {"role": "tool", "tool_call_id": "call_1", "content": "42"}
