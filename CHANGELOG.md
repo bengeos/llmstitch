@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format is based on
 - **Pricing / cost helpers.** New `Pricing` dataclass (`input_per_mtok`, `output_per_mtok` — USD per 1M tokens, matching vendor rate cards) and `Cost` dataclass (`input_cost`, `output_cost`, `total` property). `UsageTally.cost(pricing)` returns a `Cost` breakdown; `Agent` gains a `pricing: Pricing` field (default `Pricing(1.00, 2.00)` — a placeholder, not any real model's rates) and an `Agent.cost()` method that prices the current usage against it. Pass `pricing=Pricing(...)` to the `Agent` constructor for real vendor rates. No built-in per-model rate table — prices change and we don't want a stale source of truth in the library.
 - New public exports: `RetryPolicy`, `RetryAttempt`, `TokenCount`, `UsageTally`, `Pricing`, `Cost`.
 
+### Changed
+- **Internal:** extracted `_normalize_prompt`, `_provider_kwargs`, `_apply_response` helpers from `Agent.run` / `Agent.run_stream` to remove duplication. `run()` is now 20 lines and `run_stream()` is 29 lines (down from 41 and 44). `count_tokens()` picks up `_normalize_prompt` for free. No behavior change; all public APIs and the full test suite (95 tests) unchanged.
+
 ### Notes
 - Retries apply to `Agent.run` / `provider.complete(...)` only. Streaming is not retried in v0.1.3: deltas may already have been yielded to the caller before an error surfaces, with no safe way to roll them back. `Agent.run_stream` remains unchanged.
 - Gemini's `count_tokens` endpoint takes `contents` only — it does not accept tool declarations or a system instruction, so tokens those contribute are not reflected in the returned count. This is a vendor limitation.
