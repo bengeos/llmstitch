@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-04-21
+
+### Added
+- `GroqAdapter` (`llmstitch.providers.groq`) for the Groq Chat Completions API. Subclasses `OpenAIAdapter` since the wire format is identical; only the client construction differs. Enabled via the new `llmstitch[groq]` extra (depends on `groq>=0.9`) and rolled into `llmstitch[all]`.
+
+### Changed
+- CI workflow (`.github/workflows/ci.yml`) now runs on pull requests only (the `push: main` trigger was redundant with PR runs) and installs the `groq` extra alongside the other adapters.
+
 ## [0.1.0] - 2026-04-21
 
 ### Added

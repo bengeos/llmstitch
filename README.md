@@ -2,7 +2,7 @@
 
 A provider-agnostic LLM toolkit with tool calling, skills, and parallel execution.
 
-Stitch together Anthropic, OpenAI, and Gemini behind one `Agent` loop. Define tools with a decorator, compose behaviors as skills, and execute tool calls concurrently — all with a tiny, typed core.
+Stitch together Anthropic, OpenAI, Gemini, and Groq behind one `Agent` loop. Define tools with a decorator, compose behaviors as skills, and execute tool calls concurrently — all with a tiny, typed core.
 
 ## Install
 
@@ -10,7 +10,8 @@ Stitch together Anthropic, OpenAI, and Gemini behind one `Agent` loop. Define to
 pip install llmstitch[anthropic]       # just the Anthropic SDK
 pip install llmstitch[openai]          # just the OpenAI SDK
 pip install llmstitch[gemini]          # just the Gemini SDK
-pip install llmstitch[all]             # all three
+pip install llmstitch[groq]            # just the Groq SDK
+pip install llmstitch[all]             # all four
 ```
 
 The bare `pip install llmstitch` has zero runtime dependencies — provider SDKs are opt-in extras.
@@ -40,7 +41,7 @@ print(messages[-1].content)
 
 ## Features
 
-- **Provider-agnostic** — swap `AnthropicAdapter` for `OpenAIAdapter` or `GeminiAdapter` without touching your agent code.
+- **Provider-agnostic** — swap `AnthropicAdapter` for `OpenAIAdapter`, `GeminiAdapter`, or `GroqAdapter` without touching your agent code.
 - **Typed `@tool` decorator** — JSON Schema generated from type hints (`Optional`, `Literal`, defaults, async).
 - **Parallel tool execution** — when a model returns multiple tool calls in one turn, they run concurrently.
 - **Skills** — bundle a system prompt with a set of tools; compose with `.extend()`.
