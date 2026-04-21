@@ -47,7 +47,7 @@ async def main() -> None:
 
     agent = Agent(
         provider=AnthropicAdapter(),
-        model="claude-opus-4-7",
+        model="claude-haiku-4-5-20251001",
         system=(
             "For each city, call both fetch_city_population AND fetch_city_timezone. "
             "Issue all tool calls in a single turn so they can run in parallel."
@@ -57,12 +57,14 @@ async def main() -> None:
     agent.tools.register(fetch_city_timezone)
 
     start = time.perf_counter()
-    history = await agent.run("Give me the population and timezone for Tokyo, Paris, and Cairo.")
+    history = await agent.run("Give me the population and timezone for Tokyo, Paris, Addis Ababa, and Cairo.")
     elapsed = time.perf_counter() - start
 
     print(f"Total wall time: {elapsed:.2f}s (serial would be ~6s)")
     final = history[-1]
-    print(f"Final answer:\n{final.content}")
+    print("Final answer:")                                                                                                                                   
+    for block in final.text_blocks():                                                                                                                               
+        print(block.text)
 
 
 if __name__ == "__main__":

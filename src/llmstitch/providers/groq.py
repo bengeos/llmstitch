@@ -48,3 +48,14 @@ class GroqAdapter(OpenAIAdapter):
         payload.update(kwargs)
         response = await self._client.chat.completions.create(**payload)
         return self.parse_response(response)
+
+    @classmethod
+    def default_retryable(cls) -> tuple[type[BaseException], ...]:
+        import groq  # lazy — Groq ships its own SDK with OpenAI-shaped exception classes
+
+        return (
+            groq.RateLimitError,
+            groq.APITimeoutError,
+            groq.APIConnectionError,
+            groq.InternalServerError,
+        )

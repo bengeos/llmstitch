@@ -5,23 +5,28 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 
 from .agent import Agent, MaxIterationsExceeded
+from .retry import RetryAttempt, RetryPolicy
 from .tools import Skill, Tool, ToolRegistry, tool
 from .types import (
     CompletionResponse,
     ContentBlock,
+    Cost,
     Message,
     MessageStop,
+    Pricing,
     Role,
     StreamDone,
     StreamEvent,
     TextBlock,
     TextDelta,
+    TokenCount,
     ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
     ToolUseDelta,
     ToolUseStart,
     ToolUseStop,
+    UsageTally,
 )
 
 try:
@@ -51,5 +56,11 @@ __all__ = [
     "MessageStop",
     "StreamDone",
     "StreamEvent",
+    "TokenCount",
+    "UsageTally",
+    "Pricing",
+    "Cost",
+    "RetryPolicy",
+    "RetryAttempt",
     "__version__",
 ]

@@ -50,7 +50,7 @@ async def main() -> None:
 
     agent = Agent(
         provider=AnthropicAdapter(),
-        model="claude-opus-4-7",
+        model="claude-haiku-4-5-20251001",
         system=combined.system_prompt,
         tools=combined.into_registry(),
     )

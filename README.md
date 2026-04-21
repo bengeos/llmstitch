@@ -46,6 +46,9 @@ print(messages[-1].content)
 - **Typed `@tool` decorator** — JSON Schema generated from type hints (`Optional`, `Literal`, defaults, async).
 - **Parallel tool execution** — when a model returns multiple tool calls in one turn, they run concurrently.
 - **Streaming** — `Agent.run_stream()` yields provider-neutral events (`TextDelta`, `ToolUseStart` / `Delta` / `Stop`, `MessageStop`, terminal `StreamDone`) and handles tool execution between turns.
+- **Retries** — opt in with a `RetryPolicy`; exponential backoff with jitter, honors `Retry-After` headers, uses each adapter's own transient-error classes.
+- **Token counting** — `Agent.count_tokens(prompt)` via native provider endpoints (Anthropic, Gemini).
+- **Usage and cost** — `agent.usage` (a `UsageTally`) accumulates tokens, turns, API calls, and retries across a run; `agent.cost()` prices it against a `Pricing` rate card in USD.
 - **Skills** — bundle a system prompt with a set of tools; compose with `.extend()`.
 - **PEP 561 typed** — ships with `py.typed`, fully checked under `mypy --strict`.
 
@@ -67,6 +70,53 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+## Retries
+
+```python
+from llmstitch import Agent, RetryPolicy
+from llmstitch.providers.anthropic import AnthropicAdapter
+
+agent = Agent(
+    provider=AnthropicAdapter(),
+    model="claude-opus-4-7",
+    retry_policy=RetryPolicy(
+        max_attempts=3,
+        retry_on=AnthropicAdapter.default_retryable(),
+    ),
+)
+```
+
+Transient errors (rate limits, timeouts, connection drops, 5xx) are retried with exponential backoff + jitter; `Retry-After` headers raise the delay floor. Non-retryable exceptions pass through unchanged. Retries cover `Agent.run` (non-streaming) — `run_stream` is not retried in v0.1.3 because deltas may already have been yielded to the caller.
+
+## Token counting
+
+```python
+count = await agent.count_tokens("How many tokens is this?")
+print(count.input_tokens)
+```
+
+Available natively on `AnthropicAdapter` and `GeminiAdapter`. Other adapters raise `NotImplementedError` — llmstitch doesn't estimate with third-party tokenizers, since the counts can disagree with the provider's own.
+
+## Usage and cost
+
+```python
+from llmstitch import Agent, Pricing
+from llmstitch.providers.anthropic import AnthropicAdapter
+
+agent = Agent(
+    provider=AnthropicAdapter(),
+    model="claude-opus-4-7",
+    pricing=Pricing(input_per_mtok=15.00, output_per_mtok=75.00),  # paste from vendor rate card
+)
+
+await agent.run("Summarize the Iliad in three sentences.")
+
+print(agent.usage)         # UsageTally(input_tokens=..., output_tokens=..., turns=1, api_calls=1, retries=0)
+print(agent.cost().total)  # USD
+```
+
+`agent.usage` accumulates across every `run` / `run_stream` on that agent — tokens (fed by adapters that report usage), `turns` (model responses folded in), `api_calls` (provider invocations), and `retries` (from the retry policy). Call `agent.usage.reset()` to zero the counters between logical sessions, or `usage.cost(other_pricing)` directly to price the same tally against a different rate card. The default `Pricing(1.00, 2.00)` is a placeholder — pass real vendor rates for accurate costs.
+
 ## More examples
 
 The [`examples/`](examples/) directory has runnable scripts for:
@@ -77,10 +127,12 @@ The [`examples/`](examples/) directory has runnable scripts for:
 - [`providers_gallery.py`](examples/providers_gallery.py) — the same agent against every provider.
 - [`parallel_tools.py`](examples/parallel_tools.py) — parallel tool execution with order-preserving results.
 - [`async_and_timeout.py`](examples/async_and_timeout.py) — async tools, per-call timeout, captured-exception semantics.
+- [`retries.py`](examples/retries.py) — `RetryPolicy` with backoff, jitter, and an `on_retry` observability hook.
+- [`token_counting.py`](examples/token_counting.py) — `Agent.count_tokens` on Anthropic + Gemini, with graceful fallback on adapters that don't support native counting.
 
 ## Status
 
-Alpha. Retries and MCP support are on the roadmap. See [CHANGELOG.md](CHANGELOG.md) for release history and [ARCHITECTURE.md](ARCHITECTURE.md) for a walkthrough of how the library is put together.
+Alpha. MCP support and structured-output helpers are on the roadmap. See [CHANGELOG.md](CHANGELOG.md) for release history and [ARCHITECTURE.md](ARCHITECTURE.md) for a walkthrough of how the library is put together.
 
 ## License
 

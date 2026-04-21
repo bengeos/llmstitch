@@ -15,6 +15,7 @@ from ..types import (
     StreamEvent,
     TextBlock,
     TextDelta,
+    TokenCount,
     ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
@@ -223,3 +224,37 @@ class GeminiAdapter(ProviderAdapter):
                 raw=None,
             )
         )
+
+    async def count_tokens(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        system: str | None = None,
+        tools: list[ToolDefinition] | None = None,
+    ) -> TokenCount:
+        # Gemini's count_tokens endpoint takes `contents` only — it does not
+        # accept tool declarations or a system instruction, so any tokens
+        # those contribute are not reflected in the returned count. This is
+        # a vendor limitation, not an llmstitch one.
+        del system, tools
+        contents = self.translate_messages(messages)
+        response = await self._client.aio.models.count_tokens(model=model, contents=contents)
+        total = getattr(response, "total_tokens", None)
+        if total is None:
+            total = getattr(response, "total_token_count", 0)
+        return TokenCount(input_tokens=int(total or 0))
+
+    @classmethod
+    def default_retryable(cls) -> tuple[type[BaseException], ...]:
+        from google.genai import errors as genai_errors  # lazy
+
+        # google-genai raises `APIError` with an HTTP status on transient failures;
+        # we let callers catch the broad class and inspect status if they need to
+        # narrow further. `ClientError` covers 429; `ServerError` covers 5xx.
+        classes: list[type[BaseException]] = []
+        for attr in ("ClientError", "ServerError", "APIError"):
+            cls_ = getattr(genai_errors, attr, None)
+            if isinstance(cls_, type) and issubclass(cls_, BaseException):
+                classes.append(cls_)
+        return tuple(classes)
